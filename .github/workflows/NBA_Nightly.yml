@@ -1,0 +1,50 @@
+name: NBA_Nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nba-nightly
+  cancel-in-progress: false
+
+jobs:
+  update-finals:
+    environment: NBA
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore updater caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/nba_final_wikidata/lookups
+          key: nba-wikidata-sports-${{ github.run_id }}
+          restore-keys: |
+            nba-wikidata-sports-
+
+      - name: Run final updater
+        env:
+          WIKIDATA_USERNAME: ${{ secrets.WIKIDATA_USERNAME }}
+          WIKIDATA_PASSWORD: ${{ secrets.WIKIDATA_PASSWORD }}
+        run: python3 NBA_Nightly.py --verbose
+
+      - name: Save updater caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/nba_final_wikidata/lookups
+          key: nba-wikidata-sports-${{ github.run_id }}
