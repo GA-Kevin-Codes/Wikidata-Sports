@@ -1,4 +1,4 @@
-name: NBA_Nightly
+name: NBA
 
 on:
   workflow_dispatch:
