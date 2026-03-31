@@ -4,6 +4,21 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 * * * *'
+  inputs:
+    date:
+      description: Optional local game date in YYYY-MM-DD
+      required: false
+      type: string
+    dry_run:
+      description: Run without writing to Wikidata
+      required: false
+      default: false
+      type: boolean
+    ignore_window:
+      description: Run even outside the normal nightly ET window
+      required: false
+      default: true
+      type: boolean
 
 permissions:
   contents: read
