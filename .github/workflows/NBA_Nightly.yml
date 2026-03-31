@@ -3,22 +3,22 @@ name: NBA_Nightly
 on:
   workflow_dispatch:
     inputs:
-    date:
-      description: Optional local game date in YYYY-MM-DD
-      required: false
-      type: string
-    dry_run:
-      description: Run without writing to Wikidata
-      required: false
-      default: false
-      type: boolean
-    ignore_window:
-      description: Run even outside the normal nightly ET window
-      required: false
-      default: true
-      type: boolean
+      date:
+        description: Optional local game date in YYYY-MM-DD
+        required: false
+        type: string
+      dry_run:
+        description: Run without writing to Wikidata
+        required: false
+        default: false
+        type: boolean
+      ignore_window:
+        description: Run even outside the normal nightly ET window
+        required: false
+        default: true
+        type: boolean
   schedule:
-    - cron: '26 * * * *'
+    - cron: '40 * * * *'
 
 permissions:
   contents: read
@@ -54,7 +54,22 @@ jobs:
         env:
           WIKIDATA_USERNAME: ${{ secrets.WIKIDATA_USERNAME }}
           WIKIDATA_PASSWORD: ${{ secrets.WIKIDATA_PASSWORD }}
-        run: python3 NBA_Nightly.py --verbose
+          INPUT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}
+          INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          INPUT_IGNORE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_window || 'false' }}
+        run: |
+          set -euo pipefail
+          cmd=(python3 NBA_Nightly.py --verbose)
+          if [ -n "$INPUT_DATE" ]; then
+            cmd+=(--date "$INPUT_DATE")
+          fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
+            cmd+=(--dry-run)
+          fi
+          if [ "$INPUT_IGNORE_WINDOW" = "true" ]; then
+            cmd+=(--ignore-window)
+          fi
+          "${cmd[@]}"
 
       - name: Save updater caches
         if: always()
