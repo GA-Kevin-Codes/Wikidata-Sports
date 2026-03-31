@@ -19,12 +19,13 @@ USER_AGENT = "Codex NBA Final Wikidata Updater/0.1"
 TIMEZONE = "America/New_York"
 SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 BOXSCORE_URL_TEMPLATE = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
+GAME_PAGE_NUMERIC_BOXSCORE_URL_TEMPLATE = "https://www.nba.com/game/{game_id}/box-score"
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 SPARQL_URL = "https://query.wikidata.org/sparql"
 
 DEFAULT_GAME_ID_PREFIXES = "001,002,003,004,006"
 SUPPORTED_GAME_ID_PREFIXES = ("001", "002", "003", "004", "006")
-DEFAULT_START_HOUR = 10
+DEFAULT_START_HOUR = 11
 DEFAULT_OVERNIGHT_END_HOUR = 5
 
 STATE_DIR = os.path.join(".cache", "nba_final_wikidata")
@@ -154,6 +155,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-hour", type=int, default=DEFAULT_START_HOUR)
     parser.add_argument("--overnight-end-hour", type=int, default=DEFAULT_OVERNIGHT_END_HOUR)
+    parser.add_argument(
+        "--ignore-window",
+        action="store_true",
+        help="Run even outside the normal nightly America/New_York update window.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -774,6 +780,10 @@ def build_game_page_url(game: dict) -> str:
     return f"{build_game_entity_url(game)}/box-score"
 
 
+def build_numeric_game_page_url(game_id: str) -> str:
+    return GAME_PAGE_NUMERIC_BOXSCORE_URL_TEMPLATE.format(game_id=game_id)
+
+
 def normalize_team_label(team_data: dict) -> str:
     team_tricode = team_data.get("teamTricode", "")
     if team_tricode in TEAM_LABEL_ALIASES:
@@ -833,15 +843,27 @@ def match_tracked_games(wikidata_games_by_qid: Dict[str, dict], schedule_games: 
 def fetch_boxscore_game_uncached(game: dict) -> Optional[dict]:
     game_id = str(game.get("gameId", ""))
     boxscore_url = BOXSCORE_URL_TEMPLATE.format(game_id=game_id)
-    request_url = f"{boxscore_url}?_={int(time.time() * 1000)}"
-    request = urllib.request.Request(request_url, headers=build_request_headers(boxscore_url))
-    with urllib.request.urlopen(request, timeout=15.0) as response:
-        payload = json.load(response).get("game", {})
+    canonical_boxscore_url = build_game_page_url(game)
+    try:
+        request_url = f"{boxscore_url}?_={int(time.time() * 1000)}"
+        request = urllib.request.Request(request_url, headers=build_request_headers(boxscore_url))
+        with urllib.request.urlopen(request, timeout=15.0) as response:
+            payload = json.load(response).get("game", {})
+        if payload:
+            payload["sourceProvider"] = "liveData"
+            payload["apiEndpointUrl"] = boxscore_url
+            payload["referenceUrl"] = canonical_boxscore_url
+            payload["entityUrl"] = build_game_entity_url(game)
+            return payload
+    except HTTPError as exc:
+        if exc.code != 403:
+            raise
+    except (TimeoutError, URLError, OSError):
+        pass
+
+    payload = fetch_game_page_boxscore_game(game)
     if not payload:
         return None
-    payload["apiEndpointUrl"] = boxscore_url
-    payload["referenceUrl"] = build_game_page_url(game)
-    payload["entityUrl"] = build_game_entity_url(game)
     return payload
 
 
@@ -866,6 +888,100 @@ def fetch_boxscores_for_tracked_games(tracked_games: Iterable[dict]) -> Dict[str
                     log_progress(f"Boxscore fetch failed for {tracked_game['label']}: {exc}")
                 results[tracked_game["qid"]] = None
     return results
+
+
+def fetch_game_page_props(url: str, timeout: float = 20.0) -> dict:
+    headers = dict(NBA_HTTP_HEADERS)
+    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    last_error: Optional[Exception] = None
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                html = response.read().decode("utf-8", "replace")
+            break
+        except (HTTPError, TimeoutError, URLError, OSError) as exc:
+            last_error = exc
+            if attempt == MAX_FETCH_ATTEMPTS:
+                raise
+            if VERBOSE:
+                log_progress(
+                    f"Retrying game page fetch after {type(exc).__name__} from {url} "
+                    f"(attempt {attempt + 1}/{MAX_FETCH_ATTEMPTS})"
+                )
+            time.sleep(min(8.0, 1.5 * attempt))
+    else:
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Could not fetch NBA game page props from {url}")
+
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        raise ValueError(f"Could not find __NEXT_DATA__ on NBA game page {url}")
+    return json.loads(match.group(1)).get("props", {}).get("pageProps", {})
+
+
+def coerce_integer_string(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text.replace(",", "")
+    try:
+        return str(int(float(normalized)))
+    except ValueError:
+        return ""
+
+
+def coerce_duration_minutes(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        try:
+            hours_text, minutes_text = text.split(":", 1)
+            return str((int(hours_text) * 60) + int(minutes_text))
+        except ValueError:
+            return ""
+    return coerce_integer_string(text)
+
+
+def fetch_game_page_boxscore_game(game: dict) -> Optional[dict]:
+    game_id = str(game.get("gameId", ""))
+    page_props = None
+    for game_page_url in [build_game_page_url(game), build_numeric_game_page_url(game_id)]:
+        try:
+            page_props = fetch_game_page_props(game_page_url)
+            break
+        except (HTTPError, TimeoutError, URLError, OSError, ValueError):
+            continue
+    if page_props is None:
+        return None
+
+    page_game = page_props.get("game")
+    if not isinstance(page_game, dict):
+        return None
+
+    normalized = dict(page_game)
+    normalized["attendance"] = coerce_integer_string(normalized.get("attendance", ""))
+    normalized["duration"] = coerce_duration_minutes(normalized.get("duration", ""))
+    normalized["broadcasters"] = extract_game_page_broadcasters(page_game.get("broadcasters", {}))
+    canonical_entity_url = build_game_entity_url(
+        {
+            "gameId": page_game.get("gameId", game_id),
+            "awayTeam": page_game.get("awayTeam", {}),
+            "homeTeam": page_game.get("homeTeam", {}),
+        }
+    )
+    canonical_boxscore_url = f"{canonical_entity_url}/box-score"
+    normalized["sourceProvider"] = "gamePage"
+    normalized["apiEndpointUrl"] = canonical_boxscore_url
+    normalized["entityUrl"] = canonical_entity_url
+    normalized["referenceUrl"] = canonical_boxscore_url
+    return normalized
 
 
 def load_player_qids(player_ids: Iterable[str], cache: Dict[str, str]) -> Dict[str, str]:
@@ -1460,12 +1576,16 @@ def main() -> int:
     global VERBOSE
     args = parse_args()
     VERBOSE = args.verbose
+    ensure_dir(LOOKUP_CACHE_DIR)
     if args.date:
         validate_iso_date(args.date)
     game_id_prefixes = normalize_game_id_prefixes([args.game_id_prefixes])
     requested_game_ids = list(dict.fromkeys(args.game_id))
     now_local = datetime.now(ZoneInfo(TIMEZONE))
-    target_dates = determine_target_dates(args.date, now_local, args.start_hour, args.overnight_end_hour)
+    if args.ignore_window and not args.date:
+        target_dates = [now_local.date().isoformat()]
+    else:
+        target_dates = determine_target_dates(args.date, now_local, args.start_hour, args.overnight_end_hour)
     if not target_dates:
         if VERBOSE:
             log_progress("Outside the nightly final-update window in America/New_York; exiting without work.")
