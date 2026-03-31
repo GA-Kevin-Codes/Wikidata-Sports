@@ -2,9 +2,7 @@ name: NBA_Nightly
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 * * * *'
-  inputs:
+    inputs:
     date:
       description: Optional local game date in YYYY-MM-DD
       required: false
@@ -19,6 +17,8 @@ on:
       required: false
       default: true
       type: boolean
+  schedule:
+    - cron: '0 * * * *'
 
 permissions:
   contents: read
