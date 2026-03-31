@@ -25,8 +25,8 @@ SPARQL_URL = "https://query.wikidata.org/sparql"
 
 DEFAULT_GAME_ID_PREFIXES = "001,002,003,004,006"
 SUPPORTED_GAME_ID_PREFIXES = ("001", "002", "003", "004", "006")
-DEFAULT_START_HOUR = 19
-DEFAULT_OVERNIGHT_END_HOUR = 5
+DEFAULT_START_HOUR = 20
+DEFAULT_OVERNIGHT_END_HOUR = 2
 
 STATE_DIR = os.path.join(".cache", "nba_final_wikidata")
 LOOKUP_CACHE_DIR = os.path.join(STATE_DIR, "lookups")
