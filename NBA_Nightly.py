@@ -53,7 +53,7 @@ WIKIDATA_TRANSIENT_API_CODES = {"maxlag", "ratelimited", "readonly"}
 MAX_FETCH_ATTEMPTS = 4
 SPARQL_MAX_ATTEMPTS = 5
 WIKIDATA_POST_MAX_ATTEMPTS = 8
-WIKIDATA_LOGIN_MAX_ATTEMPTS = 3
+WIKIDATA_LOGIN_MAX_ATTEMPTS = 8
 BROADCASTER_LOOKUP_MAX_ATTEMPTS = 1
 
 TEAM_LABEL_ALIASES = {
@@ -437,8 +437,23 @@ class WikidataApiSession:
         self.dry_run = dry_run
         ensure_dir(SESSION_DIR)
         self.cookie_jar = http.cookiejar.LWPCookieJar(SESSION_COOKIE_PATH)
+        self.load_cookies()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
         self.csrf_token = ""
+
+    def load_cookies(self) -> None:
+        if not os.path.exists(SESSION_COOKIE_PATH):
+            return
+        try:
+            self.cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        except (FileNotFoundError, OSError, http.cookiejar.LoadError):
+            return
+
+    def save_cookies(self) -> None:
+        try:
+            self.cookie_jar.save(ignore_discard=True, ignore_expires=True)
+        except OSError:
+            return
 
     def _request(self, params: dict, post: bool) -> dict:
         encoded = urllib.parse.urlencode(params, doseq=True).encode("utf-8") if post else None
@@ -449,6 +464,22 @@ class WikidataApiSession:
 
     def api_get(self, **params: object) -> dict:
         return self._request({"format": "json", "formatversion": "2", **params}, post=False)
+
+    def is_logged_in(self, expected_username: str = "") -> bool:
+        try:
+            response = self.api_get(action="query", meta="userinfo")
+        except (HTTPError, TimeoutError, URLError, OSError):
+            return False
+        userinfo = response.get("query", {}).get("userinfo", {})
+        current_username = str(userinfo.get("name", "")).strip()
+        if not current_username or userinfo.get("anon"):
+            return False
+        if expected_username and current_username != expected_username:
+            return False
+        return True
+
+    def refresh_csrf_token(self) -> None:
+        self.csrf_token = self.api_get(action="query", meta="tokens", type="csrf")["query"]["tokens"]["csrftoken"]
 
     def api_post(self, max_attempts: int = WIKIDATA_POST_MAX_ATTEMPTS, **params: object) -> dict:
         payload = {"format": "json", "formatversion": "2", "maxlag": "5", **params}
@@ -503,6 +534,10 @@ class WikidataApiSession:
             raise SystemExit(
                 "Set WIKIDATA_USERNAME and WIKIDATA_PASSWORD (or WIKIDATA_BOT_PASSWORD) in the environment."
             )
+        expected_username = username.split("@", 1)[0]
+        if self.is_logged_in(expected_username):
+            self.refresh_csrf_token()
+            return
         login_token = self.api_get(action="query", meta="tokens", type="login")["query"]["tokens"]["logintoken"]
         response = self.api_post(
             action="login",
@@ -513,7 +548,8 @@ class WikidataApiSession:
         )
         if response.get("login", {}).get("result") != "Success":
             raise SystemExit(f"Wikidata login failed: {response}")
-        self.csrf_token = self.api_get(action="query", meta="tokens", type="csrf")["query"]["tokens"]["csrftoken"]
+        self.save_cookies()
+        self.refresh_csrf_token()
 
     def write(self, action: str, summary: str, **params: object) -> dict:
         if self.dry_run:
