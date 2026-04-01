@@ -522,7 +522,7 @@ class WikidataApiSession:
     ) -> dict:
         payload = {"format": "json", "formatversion": "2", **params}
         if include_maxlag:
-            payload["maxlag"] = str(max(1.0, WIKIDATA_WRITE_MAXLAG_SECONDS))
+            payload["maxlag"] = str(max(1, int(round(WIKIDATA_WRITE_MAXLAG_SECONDS))))
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
