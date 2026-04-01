@@ -481,8 +481,15 @@ class WikidataApiSession:
     def refresh_csrf_token(self) -> None:
         self.csrf_token = self.api_get(action="query", meta="tokens", type="csrf")["query"]["tokens"]["csrftoken"]
 
-    def api_post(self, max_attempts: int = WIKIDATA_POST_MAX_ATTEMPTS, **params: object) -> dict:
-        payload = {"format": "json", "formatversion": "2", "maxlag": "5", **params}
+    def api_post(
+        self,
+        max_attempts: int = WIKIDATA_POST_MAX_ATTEMPTS,
+        include_maxlag: bool = False,
+        **params: object,
+    ) -> dict:
+        payload = {"format": "json", "formatversion": "2", **params}
+        if include_maxlag:
+            payload["maxlag"] = "5"
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -558,7 +565,14 @@ class WikidataApiSession:
             return {}
         if not self.csrf_token:
             raise RuntimeError("Cannot write to Wikidata before login")
-        return self.api_post(action=action, token=self.csrf_token, bot="1", summary=summary, **params)
+        return self.api_post(
+            action=action,
+            token=self.csrf_token,
+            bot="1",
+            summary=summary,
+            include_maxlag=True,
+            **params,
+        )
 
     def edit_entity(self, qid: str, data: dict, summary: str, baserevid: Optional[int] = None) -> dict:
         params: Dict[str, object] = {"id": qid, "data": serialize_entity_edit_data(data)}
