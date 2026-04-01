@@ -46,6 +46,7 @@ jobs:
         with:
           path: |
             .cache/nba_final_wikidata/lookups
+            .cache/nba_final_wikidata/session
           key: nba-wikidata-sports-${{ github.run_id }}
           restore-keys: |
             nba-wikidata-sports-
@@ -77,4 +78,5 @@ jobs:
         with:
           path: |
             .cache/nba_final_wikidata/lookups
+            .cache/nba_final_wikidata/session
           key: nba-wikidata-sports-${{ github.run_id }}
