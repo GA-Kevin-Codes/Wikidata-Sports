@@ -22,7 +22,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: '0 15-23,0-2 * 3-11 *'
+    - cron: '10 15-23,0-2 * 3-11 *'
       timezone: 'America/New_York'
 
 permissions:
