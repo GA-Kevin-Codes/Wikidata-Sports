@@ -54,6 +54,8 @@ MAX_FETCH_ATTEMPTS = 4
 SPARQL_MAX_ATTEMPTS = 5
 WIKIDATA_POST_MAX_ATTEMPTS = 8
 WIKIDATA_LOGIN_MAX_ATTEMPTS = 8
+WIKIDATA_WRITE_MAX_ATTEMPTS = 2
+WIKIDATA_WRITE_MAXLAG_WAIT_CAP_SECONDS = 15.0
 BROADCASTER_LOOKUP_MAX_ATTEMPTS = 1
 
 TEAM_LABEL_ALIASES = {
@@ -514,6 +516,8 @@ class WikidataApiSession:
                     wait_seconds = max(wait_seconds, float(error.get("lag", 0.0)) * 2.0)
                 except (TypeError, ValueError):
                     pass
+                if include_maxlag:
+                    wait_seconds = min(wait_seconds, WIKIDATA_WRITE_MAXLAG_WAIT_CAP_SECONDS)
             if VERBOSE:
                 log_progress(
                     f"Wikidata API {code}; retrying in {wait_seconds:.0f}s "
@@ -570,6 +574,7 @@ class WikidataApiSession:
             token=self.csrf_token,
             bot="1",
             summary=summary,
+            max_attempts=WIKIDATA_WRITE_MAX_ATTEMPTS,
             include_maxlag=True,
             **params,
         )
