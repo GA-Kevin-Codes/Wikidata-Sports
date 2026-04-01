@@ -15,6 +15,16 @@ from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 
+def env_float(name: str, default: float) -> float:
+    raw_value = str(os.environ.get(name, "")).strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
 USER_AGENT = "Codex NBA Final Wikidata Updater/0.1"
 TIMEZONE = "America/New_York"
 SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
@@ -55,9 +65,11 @@ SPARQL_MAX_ATTEMPTS = 5
 WIKIDATA_POST_MAX_ATTEMPTS = 8
 WIKIDATA_LOGIN_MAX_ATTEMPTS = 8
 WIKIDATA_WRITE_MAX_ATTEMPTS = 2
+WIKIDATA_WRITE_MAXLAG_SECONDS = env_float("WIKIDATA_WRITE_MAXLAG_SECONDS", 30.0)
 WIKIDATA_WRITE_MAXLAG_WAIT_CAP_SECONDS = 15.0
 WIKIDATA_WRITE_SPACING_SECONDS = 5.0
 WIKIDATA_MAXLAG_COOLDOWN_SECONDS = 20.0
+WIKIDATA_WRITE_MAXLAG_BREAKER_THRESHOLD = 1
 BROADCASTER_LOOKUP_MAX_ATTEMPTS = 1
 
 TEAM_LABEL_ALIASES = {
@@ -510,7 +522,7 @@ class WikidataApiSession:
     ) -> dict:
         payload = {"format": "json", "formatversion": "2", **params}
         if include_maxlag:
-            payload["maxlag"] = "5"
+            payload["maxlag"] = str(max(1.0, WIKIDATA_WRITE_MAXLAG_SECONDS))
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -1571,12 +1583,20 @@ def process_date(
     if not schedule_games:
         if VERBOSE:
             log_progress(f"{target_date}: no schedule games found.")
-        return {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": 0, "errors": 0}
+        return {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": 0, "deferred": 0, "errors": 0}
     wikidata_games_by_qid = load_wikidata_games_for_date(target_date)
     if not wikidata_games_by_qid:
         if VERBOSE:
             log_progress(f"{target_date}: no Wikidata game items found.")
-        return {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": len(schedule_games), "errors": 0}
+        return {
+            "tracked": 0,
+            "final_seen": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "unfinished": len(schedule_games),
+            "deferred": 0,
+            "errors": 0,
+        }
     team_qids_by_label = load_current_team_qids()
     tracked_games = match_tracked_games(wikidata_games_by_qid, schedule_games, target_date)
     boxscores_by_qid = fetch_boxscores_for_tracked_games(tracked_games)
@@ -1595,10 +1615,12 @@ def process_date(
     updated = 0
     unchanged = 0
     unfinished = 0
+    deferred = 0
     final_seen = 0
     errors = 0
+    maxlag_failures = 0
     broadcaster_cache_before = dict(broadcaster_qid_cache)
-    for tracked_game in tracked_games:
+    for tracked_game_index, tracked_game in enumerate(tracked_games):
         boxscore_game = boxscores_by_qid.get(tracked_game["qid"])
         if not boxscore_game:
             unfinished += 1
@@ -1628,12 +1650,29 @@ def process_date(
             if VERBOSE:
                 log_progress(f"{target_date}: failed updating {tracked_game['label']}: {exc}")
             if is_wikidata_maxlag_error(exc):
+                maxlag_failures += 1
                 if VERBOSE:
                     log_progress(
                         f"{target_date}: cooling down {WIKIDATA_MAXLAG_COOLDOWN_SECONDS:.0f}s "
                         f"after maxlag before the next game update."
                     )
                 time.sleep(WIKIDATA_MAXLAG_COOLDOWN_SECONDS)
+                if maxlag_failures >= WIKIDATA_WRITE_MAXLAG_BREAKER_THRESHOLD:
+                    for remaining_tracked_game in tracked_games[tracked_game_index + 1:]:
+                        remaining_boxscore_game = boxscores_by_qid.get(remaining_tracked_game["qid"])
+                        if not remaining_boxscore_game:
+                            unfinished += 1
+                            continue
+                        if int(remaining_boxscore_game.get("gameStatus", 0) or 0) != 3:
+                            unfinished += 1
+                            continue
+                        deferred += 1
+                    if VERBOSE:
+                        log_progress(
+                            f"{target_date}: stopping additional writes after {maxlag_failures} maxlag hit(s); "
+                            f"deferring {deferred} remaining final game update(s) to a later run."
+                        )
+                    break
             continue
         if wrote_changes:
             updated += 1
@@ -1650,6 +1689,7 @@ def process_date(
         "updated": updated,
         "unchanged": unchanged,
         "unfinished": unfinished,
+        "deferred": deferred,
         "errors": errors,
     }
 
@@ -1679,7 +1719,7 @@ def main() -> int:
     player_qid_cache = load_lookup_cache(PLAYER_QID_CACHE_PATH)
     broadcaster_qid_cache = load_lookup_cache(BROADCASTER_QID_CACHE_PATH)
 
-    overall = {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": 0, "errors": 0}
+    overall = {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": 0, "deferred": 0, "errors": 0}
     for target_date in target_dates:
         counts = process_date(
             target_date,
@@ -1695,13 +1735,13 @@ def main() -> int:
             log_progress(
                 f"{target_date}: tracked={counts['tracked']}, final_seen={counts['final_seen']}, "
                 f"updated={counts['updated']}, unchanged={counts['unchanged']}, "
-                f"unfinished={counts['unfinished']}, errors={counts['errors']}"
+                f"unfinished={counts['unfinished']}, deferred={counts['deferred']}, errors={counts['errors']}"
             )
     if VERBOSE:
         log_progress(
             f"Overall: tracked={overall['tracked']}, final_seen={overall['final_seen']}, "
             f"updated={overall['updated']}, unchanged={overall['unchanged']}, "
-            f"unfinished={overall['unfinished']}, errors={overall['errors']}"
+            f"unfinished={overall['unfinished']}, deferred={overall['deferred']}, errors={overall['errors']}"
         )
     return 0
 
