@@ -1,0 +1,114 @@
+name: MLB Schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: Optional season year to seed; defaults to next local year
+        required: false
+        type: string
+      start_date:
+        description: Optional explicit start date in YYYY-MM-DD
+        required: false
+        type: string
+      end_date:
+        description: Optional explicit end date in YYYY-MM-DD
+        required: false
+        type: string
+      game_pks:
+        description: Optional comma-separated MLB gamePk values to restrict the run
+        required: false
+        type: string
+      game_type_codes:
+        description: Optional comma-separated MLB gameType codes
+        required: false
+        default: A,D,F,L,R,S,W
+        type: string
+      max_create:
+        description: Maximum number of new items to create
+        required: false
+        default: '300'
+        type: string
+      dry_run:
+        description: Run without writing to Wikidata
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '17 10 1 * *'
+      timezone: 'America/New_York'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlb-schedule
+  cancel-in-progress: false
+
+jobs:
+  seed-schedule:
+    environment: MLB
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore seeder caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/mlb_schedule_wikidata/lookups
+            .cache/mlb_final_wikidata/session
+          key: mlb-schedule-wikidata-sports-${{ github.run_id }}
+          restore-keys: |
+            mlb-schedule-wikidata-sports-
+
+      - name: Run schedule seeder
+        env:
+          WIKIDATA_USERNAME: ${{ secrets.WIKIDATA_USERNAME }}
+          WIKIDATA_PASSWORD: ${{ secrets.WIKIDATA_PASSWORD }}
+          WIKIDATA_WRITE_MAXLAG_SECONDS: '60'
+          INPUT_SEASON: ${{ github.event_name == 'workflow_dispatch' && inputs.season || '' }}
+          INPUT_START_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.start_date || '' }}
+          INPUT_END_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.end_date || '' }}
+          INPUT_GAME_PKS: ${{ github.event_name == 'workflow_dispatch' && inputs.game_pks || '' }}
+          INPUT_GAME_TYPE_CODES: ${{ github.event_name == 'workflow_dispatch' && inputs.game_type_codes || 'A,D,F,L,R,S,W' }}
+          INPUT_MAX_CREATE: ${{ github.event_name == 'workflow_dispatch' && inputs.max_create || '300' }}
+          INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          cmd=(python3 MLB_Schedule.py --verbose --game-type-codes "$INPUT_GAME_TYPE_CODES" --max-create "$INPUT_MAX_CREATE")
+          if [ -n "$INPUT_SEASON" ]; then
+            cmd+=(--season "$INPUT_SEASON")
+          fi
+          if [ -n "$INPUT_START_DATE" ] || [ -n "$INPUT_END_DATE" ]; then
+            cmd+=(--start-date "$INPUT_START_DATE" --end-date "$INPUT_END_DATE")
+          fi
+          if [ -n "$INPUT_GAME_PKS" ]; then
+            IFS=',' read -r -a game_pks <<< "$INPUT_GAME_PKS"
+            for game_pk in "${game_pks[@]}"; do
+              game_pk="${game_pk//[[:space:]]/}"
+              if [ -n "$game_pk" ]; then
+                cmd+=(--game-pk "$game_pk")
+              fi
+            done
+          fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
+            cmd+=(--dry-run)
+          fi
+          "${cmd[@]}"
+
+      - name: Save seeder caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/mlb_schedule_wikidata/lookups
+            .cache/mlb_final_wikidata/session
+          key: mlb-schedule-wikidata-sports-${{ github.run_id }}
