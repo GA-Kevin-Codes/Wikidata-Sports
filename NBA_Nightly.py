@@ -35,8 +35,7 @@ SPARQL_URL = "https://query.wikidata.org/sparql"
 
 DEFAULT_GAME_ID_PREFIXES = "001,002,003,004,006"
 SUPPORTED_GAME_ID_PREFIXES = ("001", "002", "003", "004", "006")
-DEFAULT_START_HOUR = 20
-DEFAULT_OVERNIGHT_END_HOUR = 2
+DEFAULT_OVERNIGHT_END_HOUR = 4
 
 STATE_DIR = os.path.join(".cache", "nba_final_wikidata")
 LOOKUP_CACHE_DIR = os.path.join(STATE_DIR, "lookups")
@@ -173,12 +172,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GAME_ID_PREFIXES,
         help=f"Comma-separated game ID prefixes to consider. Defaults to {DEFAULT_GAME_ID_PREFIXES}.",
     )
-    parser.add_argument("--start-hour", type=int, default=DEFAULT_START_HOUR)
-    parser.add_argument("--overnight-end-hour", type=int, default=DEFAULT_OVERNIGHT_END_HOUR)
     parser.add_argument(
-        "--ignore-window",
-        action="store_true",
-        help="Run even outside the normal nightly America/New_York update window.",
+        "--overnight-end-hour",
+        type=int,
+        default=DEFAULT_OVERNIGHT_END_HOUR,
+        help=(
+            "When no explicit date is supplied, treat runs at or before this America/New_York hour "
+            "as targeting the previous local game date."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -1560,15 +1561,12 @@ def update_wikidata_game(session: WikidataApiSession, game_qid: str, snapshot: d
     return True
 
 
-def determine_target_dates(explicit_date: str, now_local: datetime, start_hour: int, overnight_end_hour: int) -> List[str]:
+def determine_target_dates(explicit_date: str, now_local: datetime, overnight_end_hour: int) -> List[str]:
     if explicit_date:
         return [explicit_date]
-    hour = now_local.hour
-    if hour >= start_hour:
-        return [now_local.date().isoformat()]
-    if hour <= overnight_end_hour:
+    if now_local.hour <= overnight_end_hour:
         return [(now_local.date() - timedelta(days=1)).isoformat()]
-    return []
+    return [now_local.date().isoformat()]
 
 
 def process_date(
@@ -1704,14 +1702,7 @@ def main() -> int:
     game_id_prefixes = normalize_game_id_prefixes([args.game_id_prefixes])
     requested_game_ids = list(dict.fromkeys(args.game_id))
     now_local = datetime.now(ZoneInfo(TIMEZONE))
-    if args.ignore_window and not args.date:
-        target_dates = [now_local.date().isoformat()]
-    else:
-        target_dates = determine_target_dates(args.date, now_local, args.start_hour, args.overnight_end_hour)
-    if not target_dates:
-        if VERBOSE:
-            log_progress("Outside the nightly final-update window in America/New_York; exiting without work.")
-        return 0
+    target_dates = determine_target_dates(args.date, now_local, args.overnight_end_hour)
 
     session = WikidataApiSession(dry_run=args.dry_run)
     session.login_from_env()
