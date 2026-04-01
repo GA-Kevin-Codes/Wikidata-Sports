@@ -1,0 +1,89 @@
+name: MLB
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: Optional local official date in YYYY-MM-DD
+        required: false
+        type: string
+      game_pk:
+        description: Optional MLB gamePk to restrict the run
+        required: false
+        type: string
+      game_type_codes:
+        description: Optional comma-separated MLB gameType codes
+        required: false
+        default: A,D,F,L,R,S,W
+        type: string
+      dry_run:
+        description: Run without writing to Wikidata
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 15-23,0-2 * 3-11 *'
+      timezone: 'America/New_York'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlb-nightly
+  cancel-in-progress: false
+
+jobs:
+  update-finals:
+    environment: MLB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore updater caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/mlb_final_wikidata/lookups
+            .cache/mlb_final_wikidata/session
+          key: mlb-wikidata-sports-${{ github.run_id }}
+          restore-keys: |
+            mlb-wikidata-sports-
+
+      - name: Run final updater
+        env:
+          WIKIDATA_USERNAME: ${{ secrets.WIKIDATA_USERNAME }}
+          WIKIDATA_PASSWORD: ${{ secrets.WIKIDATA_PASSWORD }}
+          WIKIDATA_WRITE_MAXLAG_SECONDS: '60'
+          INPUT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}
+          INPUT_GAME_PK: ${{ github.event_name == 'workflow_dispatch' && inputs.game_pk || '' }}
+          INPUT_GAME_TYPE_CODES: ${{ github.event_name == 'workflow_dispatch' && inputs.game_type_codes || 'A,D,F,L,R,S,W' }}
+          INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          cmd=(python3 MLB_Nightly.py --verbose --game-type-codes "$INPUT_GAME_TYPE_CODES")
+          if [ -n "$INPUT_DATE" ]; then
+            cmd+=(--date "$INPUT_DATE")
+          fi
+          if [ -n "$INPUT_GAME_PK" ]; then
+            cmd+=(--game-pk "$INPUT_GAME_PK")
+          fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
+            cmd+=(--dry-run)
+          fi
+          "${cmd[@]}"
+
+      - name: Save updater caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/mlb_final_wikidata/lookups
+            .cache/mlb_final_wikidata/session
+          key: mlb-wikidata-sports-${{ github.run_id }}
