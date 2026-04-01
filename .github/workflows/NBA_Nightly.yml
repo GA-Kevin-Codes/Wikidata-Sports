@@ -12,13 +12,9 @@ on:
         required: false
         default: false
         type: boolean
-      ignore_window:
-        description: Run even outside the normal nightly ET window
-        required: false
-        default: true
-        type: boolean
   schedule:
-    - cron: '0 0-6 * 10-12,1-6 *'
+    - cron: '0 20-23,0-4 * 10-12,1-6 *'
+      timezone: 'America/New_York'
 
 permissions:
   contents: read
@@ -58,7 +54,6 @@ jobs:
           WIKIDATA_WRITE_MAXLAG_SECONDS: '60'
           INPUT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}
           INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          INPUT_IGNORE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_window || 'false' }}
         run: |
           set -euo pipefail
           cmd=(python3 NBA_Nightly.py --verbose)
@@ -67,9 +62,6 @@ jobs:
           fi
           if [ "$INPUT_DRY_RUN" = "true" ]; then
             cmd+=(--dry-run)
-          fi
-          if [ "$INPUT_IGNORE_WINDOW" = "true" ]; then
-            cmd+=(--ignore-window)
           fi
           "${cmd[@]}"
 
