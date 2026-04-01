@@ -56,6 +56,8 @@ WIKIDATA_POST_MAX_ATTEMPTS = 8
 WIKIDATA_LOGIN_MAX_ATTEMPTS = 8
 WIKIDATA_WRITE_MAX_ATTEMPTS = 2
 WIKIDATA_WRITE_MAXLAG_WAIT_CAP_SECONDS = 15.0
+WIKIDATA_WRITE_SPACING_SECONDS = 5.0
+WIKIDATA_MAXLAG_COOLDOWN_SECONDS = 20.0
 BROADCASTER_LOOKUP_MAX_ATTEMPTS = 1
 
 TEAM_LABEL_ALIASES = {
@@ -142,6 +144,10 @@ def log_progress(message: str) -> None:
 
 def log_event(message: str) -> None:
     print(message, flush=True)
+
+
+def is_wikidata_maxlag_error(exc: BaseException) -> bool:
+    return "Wikidata API error maxlag" in str(exc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -442,6 +448,7 @@ class WikidataApiSession:
         self.load_cookies()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
         self.csrf_token = ""
+        self.next_write_not_before_monotonic = 0.0
 
     def load_cookies(self) -> None:
         if not os.path.exists(SESSION_COOKIE_PATH):
@@ -482,6 +489,18 @@ class WikidataApiSession:
 
     def refresh_csrf_token(self) -> None:
         self.csrf_token = self.api_get(action="query", meta="tokens", type="csrf")["query"]["tokens"]["csrftoken"]
+
+    def wait_for_write_slot(self) -> None:
+        if self.dry_run:
+            return
+        now = time.monotonic()
+        if now < self.next_write_not_before_monotonic:
+            wait_seconds = self.next_write_not_before_monotonic - now
+            if VERBOSE:
+                log_progress(f"Pacing Wikidata write; sleeping {wait_seconds:.1f}s before next edit.")
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+        self.next_write_not_before_monotonic = now + WIKIDATA_WRITE_SPACING_SECONDS
 
     def api_post(
         self,
@@ -569,6 +588,7 @@ class WikidataApiSession:
             return {}
         if not self.csrf_token:
             raise RuntimeError("Cannot write to Wikidata before login")
+        self.wait_for_write_slot()
         return self.api_post(
             action=action,
             token=self.csrf_token,
@@ -1607,6 +1627,13 @@ def process_date(
             errors += 1
             if VERBOSE:
                 log_progress(f"{target_date}: failed updating {tracked_game['label']}: {exc}")
+            if is_wikidata_maxlag_error(exc):
+                if VERBOSE:
+                    log_progress(
+                        f"{target_date}: cooling down {WIKIDATA_MAXLAG_COOLDOWN_SECONDS:.0f}s "
+                        f"after maxlag before the next game update."
+                    )
+                time.sleep(WIKIDATA_MAXLAG_COOLDOWN_SECONDS)
             continue
         if wrote_changes:
             updated += 1
