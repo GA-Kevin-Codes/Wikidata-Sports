@@ -55,6 +55,7 @@ jobs:
         env:
           WIKIDATA_USERNAME: ${{ secrets.WIKIDATA_USERNAME }}
           WIKIDATA_PASSWORD: ${{ secrets.WIKIDATA_PASSWORD }}
+          WIKIDATA_WRITE_MAXLAG_SECONDS: '30'
           INPUT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}
           INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           INPUT_IGNORE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_window || 'false' }}
