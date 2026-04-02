@@ -37,6 +37,8 @@ SPARQL_URL = "https://query.wikidata.org/sparql"
 DEFAULT_GAME_TYPE_CODES = "A,D,F,L,R,S,W"
 SUPPORTED_GAME_TYPE_CODES = ("A", "D", "E", "F", "L", "R", "S", "W")
 DEFAULT_OVERNIGHT_END_HOUR = 4
+DEFAULT_SEASON_START_MONTH = 2
+DEFAULT_SEASON_START_DAY = 1
 
 STATE_DIR = os.path.join(".cache", "mlb_final_wikidata")
 LOOKUP_CACHE_DIR = os.path.join(STATE_DIR, "lookups")
@@ -51,6 +53,7 @@ BASEBALL_TEAM_QID = "Q13027888"
 HOME_TEAM_ROLE_QID = "Q24633211"
 AWAY_TEAM_ROLE_QID = "Q24633216"
 HTTPS_QID = "Q44484"
+ENGLISH_QID = "Q1860"
 MINUTE_UNIT_QID = "Q7727"
 CALENDAR_MODEL_QID = "Q1985727"
 
@@ -62,7 +65,7 @@ WIKIDATA_LOGIN_MAX_ATTEMPTS = 8
 WIKIDATA_WRITE_MAX_ATTEMPTS = 2
 WIKIDATA_WRITE_MAXLAG_SECONDS = env_float("WIKIDATA_WRITE_MAXLAG_SECONDS", 30.0)
 WIKIDATA_WRITE_MAXLAG_WAIT_CAP_SECONDS = 15.0
-WIKIDATA_WRITE_SPACING_SECONDS = 5.0
+WIKIDATA_WRITE_SPACING_SECONDS = env_float("WIKIDATA_WRITE_SPACING_SECONDS", 0.0)
 WIKIDATA_MAXLAG_COOLDOWN_SECONDS = 20.0
 WIKIDATA_WRITE_MAXLAG_BREAKER_THRESHOLD = 1
 OFFICIAL_LOOKUP_MAX_ATTEMPTS = 1
@@ -115,11 +118,25 @@ def is_wikidata_maxlag_error(exc: BaseException) -> bool:
     return "Wikidata API error maxlag" in str(exc)
 
 
+def is_wikidata_badtoken_error(exc: BaseException) -> bool:
+    return "Wikidata API error badtoken" in str(exc)
+
+
+def is_no_automatic_entity_id_error(exc: BaseException) -> bool:
+    return "no-automatic-entity-id" in str(exc)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Update Wikidata for completed MLB games only. Intended for hourly GitHub Actions runs."
     )
     parser.add_argument("--date", default="", help="Explicit local official date in YYYY-MM-DD.")
+    parser.add_argument(
+        "--season",
+        type=int,
+        default=0,
+        help="Process the whole MLB season to date for the given season year (February 1 through today, capped at November 30).",
+    )
     parser.add_argument("--game-pk", action="append", default=[], help="Specific MLB gamePk value(s) to restrict updates to.")
     parser.add_argument(
         "--game-type-codes",
@@ -309,6 +326,8 @@ def remove_qualifier_hashes_from_claim(claim: dict, prop: str, hashes: Iterable[
 
 def build_entity_edit_data(entity: dict) -> dict:
     data: Dict[str, object] = {}
+    if entity.get("labels"):
+        data["labels"] = entity["labels"]
     if entity.get("descriptions"):
         data["descriptions"] = entity["descriptions"]
     claims: List[dict] = []
@@ -326,6 +345,22 @@ def serialize_entity_edit_data(data: dict) -> str:
 def fetch_entity(qid: str) -> dict:
     url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
     return fetch_json(url, timeout=20.0)["entities"][qid]
+
+
+def fetch_entities(qids: Iterable[str]) -> Dict[str, dict]:
+    ordered_qids = [str(qid).strip() for qid in qids if str(qid).strip()]
+    if not ordered_qids:
+        return {}
+    params = urllib.parse.urlencode(
+        {
+            "action": "wbgetentities",
+            "format": "json",
+            "ids": "|".join(ordered_qids),
+            "props": "labels|descriptions|claims|info",
+        }
+    )
+    url = f"{WIKIDATA_API_URL}?{params}"
+    return fetch_json(url, timeout=30.0).get("entities", {})
 
 
 def fetch_entity_search(search: str, limit: int = 10) -> List[dict]:
@@ -540,24 +575,40 @@ class WikidataApiSession:
             if VERBOSE:
                 log_progress(f"DRY RUN {action}: {summary}")
             return {}
-        if not self.csrf_token:
-            raise RuntimeError("Cannot write to Wikidata before login")
-        self.wait_for_write_slot()
-        return self.api_post(
-            action=action,
-            token=self.csrf_token,
-            bot="1",
-            summary=summary,
-            max_attempts=WIKIDATA_WRITE_MAX_ATTEMPTS,
-            include_maxlag=True,
-            **params,
-        )
+        for attempt in range(1, 3):
+            if not self.csrf_token:
+                self.login_from_env()
+            self.wait_for_write_slot()
+            try:
+                return self.api_post(
+                    action=action,
+                    token=self.csrf_token,
+                    bot="1",
+                    summary=summary,
+                    max_attempts=WIKIDATA_WRITE_MAX_ATTEMPTS,
+                    include_maxlag=True,
+                    **params,
+                )
+            except RuntimeError as exc:
+                if not is_wikidata_badtoken_error(exc) or attempt >= 2:
+                    raise
+                if VERBOSE:
+                    log_progress("Wikidata API badtoken; refreshing login session and retrying write.")
+                self.csrf_token = ""
+                self.login_from_env()
+        raise RuntimeError("Cannot write to Wikidata before login")
 
     def edit_entity(self, qid: str, data: dict, summary: str, baserevid: Optional[int] = None) -> dict:
         params: Dict[str, object] = {"id": qid, "data": serialize_entity_edit_data(data)}
         if baserevid is not None:
             params["baserevid"] = str(baserevid)
         return self.write("wbeditentity", summary, **params)
+
+    def remove_claims(self, claim_ids: Iterable[str], summary: str) -> dict:
+        filtered_ids = [str(claim_id).strip() for claim_id in claim_ids if str(claim_id).strip()]
+        if not filtered_ids:
+            return {}
+        return self.write("wbremoveclaims", summary, claim="|".join(filtered_ids))
 
 
 def normalize_lookup_key(value: str) -> str:
@@ -732,6 +783,7 @@ def match_tracked_games(
     schedule_games: Iterable[dict],
     target_date: str,
     team_qids_by_label: Dict[str, str],
+    log_missing_matches: bool = True,
 ) -> List[dict]:
     by_game_pk = {
         row["entity_game_pk"]: row
@@ -776,7 +828,7 @@ def match_tracked_games(
                     )
                     continue
         if wikidata_row is None:
-            if VERBOSE:
+            if VERBOSE and log_missing_matches:
                 log_progress(f"Skipping MLB game with no Wikidata item match: {away_label} at {home_label} ({target_date})")
             continue
         tracked_games.append(
@@ -788,6 +840,49 @@ def match_tracked_games(
             }
         )
     return tracked_games
+
+
+def seed_schedule_items_for_date(
+    target_date: str,
+    schedule_games: List[dict],
+    requested_game_pks: List[str],
+    game_type_codes: List[str],
+    session: "WikidataApiSession",
+    team_qids_by_label: Dict[str, str],
+) -> Dict[str, int]:
+    import MLB_Schedule as mlb_schedule
+
+    team_cache = mlb_schedule.load_lookup_cache(mlb_schedule.TEAM_QID_CACHE_PATH)
+    venue_cache = mlb_schedule.load_lookup_cache(mlb_schedule.VENUE_QID_CACHE_PATH)
+    season_cache = mlb_schedule.load_lookup_cache(mlb_schedule.SEASON_QID_CACHE_PATH)
+    game_qid_cache = mlb_schedule.load_lookup_cache(mlb_schedule.GAME_QID_CACHE_PATH)
+    existing_rows_by_qid = mlb_schedule.load_existing_games(target_date, target_date)
+    entity_cache = mlb_schedule.prefetch_existing_entities(existing_rows_by_qid)
+    mlb_schedule.prime_game_qid_cache_from_existing(existing_rows_by_qid, game_qid_cache)
+
+    max_create = len(schedule_games) if not requested_game_pks else max(1, len(requested_game_pks))
+    counts = mlb_schedule.process_schedule(
+        session,
+        schedule_games,
+        existing_rows_by_qid,
+        entity_cache,
+        team_qids_by_label,
+        team_cache,
+        venue_cache,
+        season_cache,
+        game_qid_cache,
+        max_create,
+    )
+    mlb_schedule.save_lookup_cache(mlb_schedule.TEAM_QID_CACHE_PATH, team_cache)
+    mlb_schedule.save_lookup_cache(mlb_schedule.VENUE_QID_CACHE_PATH, venue_cache)
+    mlb_schedule.save_lookup_cache(mlb_schedule.SEASON_QID_CACHE_PATH, season_cache)
+    mlb_schedule.save_lookup_cache(mlb_schedule.GAME_QID_CACHE_PATH, game_qid_cache)
+    if VERBOSE and (counts["created"] or counts["updated"] or counts["errors"]):
+        log_progress(
+            f"{target_date}: schedule seed pass created={counts['created']}, updated={counts['updated']}, "
+            f"unchanged={counts['unchanged']}, skipped={counts['skipped']}, errors={counts['errors']}"
+        )
+    return counts
 
 
 def fetch_boxscore_game_uncached(game: dict) -> Optional[dict]:
@@ -1118,6 +1213,8 @@ def ensure_url_claim(entity: dict, qid: str, prop: str, url_value: str, referenc
     if claim is None:
         claim = create_claim(qid, prop, "url", url_value)
         append_claim(entity, prop, claim)
+    if prop == "P856":
+        ensure_single_item_qualifier(claim, "P407", ENGLISH_QID)
     ensure_reference(claim, reference_url, retrieved_date)
     return claim
 
@@ -1228,6 +1325,7 @@ def ensure_game_entity_url(entity: dict, snapshot: dict) -> None:
             snapshot["retrieved_date"],
         )
     else:
+        ensure_single_item_qualifier(claim, "P407", ENGLISH_QID)
         ensure_reference(claim, snapshot["reference_url"], snapshot["retrieved_date"])
 
 
@@ -1343,6 +1441,30 @@ def determine_target_dates(explicit_date: str, now_local: datetime, overnight_en
     return [now_local.date().isoformat()]
 
 
+def determine_season_target_dates(season_year: int, now_local: datetime) -> List[str]:
+    season_start = datetime(
+        season_year,
+        DEFAULT_SEASON_START_MONTH,
+        DEFAULT_SEASON_START_DAY,
+        tzinfo=now_local.tzinfo,
+    ).date()
+    season_end_cap = datetime(season_year, 11, 30, tzinfo=now_local.tzinfo).date()
+    if season_year > now_local.year:
+        raise SystemExit(f"Season {season_year} is in the future for America/New_York.")
+    if season_year == now_local.year:
+        season_end = min(now_local.date(), season_end_cap)
+    else:
+        season_end = season_end_cap
+    if season_end < season_start:
+        return []
+    target_dates: List[str] = []
+    current_date = season_start
+    while current_date <= season_end:
+        target_dates.append(current_date.isoformat())
+        current_date += timedelta(days=1)
+    return target_dates
+
+
 def process_date(
     target_date: str,
     requested_game_pks: List[str],
@@ -1358,21 +1480,44 @@ def process_date(
         return {"tracked": 0, "final_seen": 0, "updated": 0, "unchanged": 0, "unfinished": 0, "deferred": 0, "errors": 0}
 
     team_qids_by_label = load_current_team_qids()
+    seed_counts = {"created": 0, "updated": 0, "unchanged": 0, "skipped": 0, "errors": 0}
     wikidata_games_by_qid = load_wikidata_games_for_date(target_date)
-    if not wikidata_games_by_qid:
-        if VERBOSE:
-            log_progress(f"{target_date}: no Wikidata MLB game items found.")
-        return {
-            "tracked": 0,
-            "final_seen": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "unfinished": len(schedule_games),
-            "deferred": 0,
-            "errors": 0,
-        }
+    tracked_games = match_tracked_games(
+        wikidata_games_by_qid,
+        schedule_games,
+        target_date,
+        team_qids_by_label,
+        log_missing_matches=False,
+    )
+    if not wikidata_games_by_qid or len(tracked_games) < len(schedule_games):
+        if VERBOSE and not wikidata_games_by_qid:
+            log_progress(f"{target_date}: no Wikidata MLB game items found; seeding schedule items before final sync.")
+        elif VERBOSE:
+            log_progress(
+                f"{target_date}: only matched {len(tracked_games)} of {len(schedule_games)} schedule game(s); "
+                "running schedule seed pass for any missing items."
+            )
+        seed_counts = seed_schedule_items_for_date(
+            target_date,
+            schedule_games,
+            requested_game_pks,
+            game_type_codes,
+            session,
+            team_qids_by_label,
+        )
+        wikidata_games_by_qid = load_wikidata_games_for_date(target_date)
+        tracked_games = match_tracked_games(wikidata_games_by_qid, schedule_games, target_date, team_qids_by_label)
+        if not wikidata_games_by_qid:
+            return {
+                "tracked": 0,
+                "final_seen": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "unfinished": len(schedule_games),
+                "deferred": 0,
+                "errors": seed_counts["errors"],
+            }
 
-    tracked_games = match_tracked_games(wikidata_games_by_qid, schedule_games, target_date, team_qids_by_label)
     boxscores_by_qid = fetch_boxscores_for_tracked_games(tracked_games)
 
     player_ids: List[str] = []
@@ -1390,7 +1535,7 @@ def process_date(
     unfinished = 0
     deferred = 0
     final_seen = 0
-    errors = 0
+    errors = seed_counts["errors"]
     maxlag_failures = 0
     official_cache_before = dict(official_qid_cache)
 
@@ -1472,13 +1617,22 @@ def main() -> int:
     args = parse_args()
     VERBOSE = args.verbose
     ensure_dir(LOOKUP_CACHE_DIR)
+    if args.date and args.season:
+        raise SystemExit("Use either --date or --season, not both.")
     if args.date:
         validate_iso_date(args.date)
 
     game_type_codes = normalize_game_type_codes([args.game_type_codes])
     requested_game_pks = list(dict.fromkeys(str(game_pk).strip() for game_pk in args.game_pk if str(game_pk).strip()))
     now_local = datetime.now(ZoneInfo(TIMEZONE))
-    target_dates = determine_target_dates(args.date, now_local, args.overnight_end_hour)
+    if args.season:
+        target_dates = determine_season_target_dates(args.season, now_local)
+    else:
+        target_dates = determine_target_dates(args.date, now_local, args.overnight_end_hour)
+    if not target_dates:
+        if VERBOSE:
+            log_progress("No target dates selected.")
+        return 0
 
     session = WikidataApiSession(dry_run=args.dry_run)
     session.login_from_env()
